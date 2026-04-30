@@ -1,13 +1,13 @@
 # nature7pro-zigbee-bridge
 
-Repurpose a **LifeSmart Nature 7 Pro** smart-home hub as a network-attached **Zigbee coordinator** for [zigbee2mqtt](https://www.zigbee2mqtt.io/) / Home Assistant.
+Repurpose a **LifeSmart Nature 7 Pro** smart-home hub as a network-attached **Zigbee coordinator** for **Home Assistant** (via the built-in ZHA integration) or **zigbee2mqtt**.
 
-The hub already contains a Silicon Labs **EFR32** Zigbee NCP (LifeSmart part `LSZG02AGTv2.10`) speaking standard EmberZNet **EZSP over ASH** on `/dev/ttyS5` at 115200 8N1. This project replaces LifeSmart's gateway daemon with a tiny **TCP-to-serial bridge** so z2m's `ember` adapter can drive the radio over the network.
+The hub already contains a Silicon Labs **EFR32** Zigbee NCP (LifeSmart part `LSZG02AGTv2.10`) speaking standard EmberZNet **EZSP over ASH** on `/dev/ttyS5` at 115200 8N1. This project replaces LifeSmart's gateway daemon with a tiny **TCP-to-serial bridge** so any EmberZNet-over-TCP client — Home Assistant's ZHA `ember` radio type, or z2m's `ember` adapter — can drive the radio over the network. **No MQTT broker or zigbee2mqtt required**: ZHA ships with native Ember support and talks to the bridge directly.
 
 ```
 ┌──────────────────────┐       TCP :8880          ┌──────────────────────┐
-│  Home Assistant /    │  ◄────────────────────►  │  Nature 7 Pro hub    │
-│  zigbee2mqtt (ember) │                          │  zb_bridge.lua       │
+│  Home Assistant ZHA  │  ◄────────────────────►  │  Nature 7 Pro hub    │
+│  (ember) — or z2m    │                          │  zb_bridge.lua       │
 └──────────────────────┘                          │       │ /dev/ttyS5   │
                                                   │       ▼              │
                                                   │  EFR32 NCP (EZSP)    │
@@ -23,12 +23,26 @@ The hub already contains a Silicon Labs **EFR32** Zigbee NCP (LifeSmart part `LS
 
 ## Hardware tested
 
-- LifeSmart Nature 7 Pro — Rockchip RK3566, Android 11 `userdebug`, ADB-over-TCP on port 5555 with root.
-- The hub must already be on your LAN with ADB-over-TCP enabled. (If yours is locked, this project won't help you unlock it.)
+- LifeSmart Nature 7 Pro — Rockchip RK3566, Android 11 `userdebug`, root available over ADB.
+
+## Getting ADB access
+
+ADB is **not enabled over the network by default** on this device, and there is no externally accessible USB port. The trick:
+
+1. **Open the hub.** Pop the case (a few clips and screws — no glue). On the motherboard there is a hidden, unpopulated-looking **micro-USB port labeled `OTG`**. This is a functional ADB port.
+2. **Plug a USB cable into `OTG` *before* powering the device on.** Android debugging on this image only initializes if the cable is detected at boot — hot-plugging after boot does nothing.
+3. **Power on with the cable connected** to your host machine. `adb devices` should now list the hub.
+4. **Enable ADB over TCP** so you don't have to keep the case open:
+   ```sh
+   adb root
+   adb tcpip 5555
+   adb connect <hub-ip>:5555
+   ```
+   You can then unplug USB, close the hub, and use ADB-over-LAN from now on. (Note: `adb tcpip` does not always survive a reboot on this image; if it doesn't stick, persist it via a property or an init hook of your choice.)
 
 ## Install
 
-Requirements on the host: `adb`, the hub reachable on the LAN.
+Requirements on the host: `adb`, the hub reachable on the LAN with ADB-over-TCP enabled (see above).
 
 ```sh
 git clone https://github.com/<you>/nature7pro-zigbee-bridge
@@ -37,7 +51,14 @@ cd nature7pro-zigbee-bridge
 adb -s 192.168.0.180:5555 reboot
 ```
 
-Then point zigbee2mqtt at it:
+Then point Home Assistant or zigbee2mqtt at it.
+
+**Home Assistant (ZHA)** — Settings → Devices & Services → Add Integration → *Zigbee Home Automation*:
+
+- Radio type: **EZSP** (a.k.a. Silicon Labs Ember)
+- Serial device path: `socket://192.168.0.180:8880`
+
+**zigbee2mqtt** — in `configuration.yaml`:
 
 ```yaml
 serial:
@@ -45,7 +66,7 @@ serial:
   port: tcp://192.168.0.180:8880
 ```
 
-The first time z2m connects it will form a fresh Zigbee network, wiping any LifeSmart-paired devices. Re-pair them through z2m.
+The first time the coordinator forms its network it will wipe any LifeSmart-paired devices — re-pair them through ZHA / z2m.
 
 ## Revert
 
@@ -116,11 +137,11 @@ So `lifesmart_check.sh` proceeds in three phases:
 
 ## Caveats
 
-- **You will lose your LifeSmart Zigbee pairings.** z2m forms its own network, which wipes the chip's network keys.
-- **The hub will no longer function as a LifeSmart device** while the bridge is active. The LifeSmart Android apps still launch but they have no gateway daemon to talk to.
+- **You will lose your LifeSmart Zigbee pairings.** ZHA / z2m forms its own network, which wipes the chip's network keys.
+- **This specific Nature 7 Pro stops acting as a LifeSmart hub.** Your wider LifeSmart setup is unaffected: the LifeSmart cloud, the app, and any **CoSS** (LifeSmart's proprietary sub-GHz RF protocol) devices keep working as long as you have another LifeSmart Smart Station — or another hub acting as a sub-station — on the account. It's only this unit that loses its gateway role: the LifeSmart `zdogd` daemon is killed at boot, so this Nature 7 Pro will no longer bridge CoSS or its onboard Zigbee radio into LifeSmart cloud while the bridge is running.
 - **During each boot's 12 s wake window, `mga.lua` briefly attempts to connect to LifeSmart cloud** (`47.88.78.117:18894`). The first connect timeout is 5 s, so the second attempt usually doesn't complete before our `pkill` lands — but if you want hard isolation, blackhole that IP via `iptables`.
-- **EZSP version not measured.** `LSZG02AGTv2.10` is likely EmberZNet ~6.7–6.10. If z2m demands a newer NCP, you can OTA-flash the EFR32 via bootloader option `1` (XMODEM upload of a `.gbl`) — but you'll need to source a compatible image.
-- **The bridge handles one TCP client at a time.** Fine for z2m.
+- **EZSP version not measured.** `LSZG02AGTv2.10` is likely EmberZNet ~6.7–6.10. If your client (ZHA / z2m) demands a newer NCP, you can OTA-flash the EFR32 via bootloader option `1` (XMODEM upload of a `.gbl`) — but you'll need to source a compatible image.
+- **The bridge handles one TCP client at a time.** Fine for ZHA or z2m.
 - **Tested on exactly one hub.** Yours may differ; verify with ADB before relying on this in production.
 
 ## Investigation notes
