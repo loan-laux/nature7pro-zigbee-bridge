@@ -76,7 +76,14 @@ local POLLNVAL    = 0x0020
 local SERIAL = arg[1] or "/dev/ttyS5"
 local PORT   = tonumber(arg[2]) or 8880
 
-local function logf(fmt, ...) io.stderr:write(string.format(fmt, ...), "\n"); io.stderr:flush() end
+local function logf(fmt, ...)
+  io.stderr:write(os.date("%Y-%m-%d %H:%M:%S ") .. string.format(fmt, ...) .. "\n")
+  io.stderr:flush()
+end
+
+-- Exit(1) after this many consecutive dead sessions (c2s>0, s2c=0) to signal
+-- the watchdog to re-run the EFR32 wake sequence before restarting the bridge.
+local MAX_DEAD_SESSIONS = 3
 
 -- Open serial port — set termios ourselves (don't trust external stty)
 local sfd = C.open(SERIAL, O_RDWR + O_NOCTTY + O_NONBLOCK)
@@ -118,6 +125,7 @@ if C.listen(lfd, 1) ~= 0 then error("listen: "..estr()) end
 logf("[bridge] listening on 0.0.0.0:%d", PORT)
 
 local buf = ffi.new("uint8_t[?]", 8192)
+local dead_sessions = 0
 
 while true do
   local cfd = C.accept(lfd, nil, nil)
@@ -184,6 +192,21 @@ while true do
   dump_stats()
   C.shutdown(cfd, SHUT_RDWR)
   C.close(cfd)
+
+  -- Detect chip wedge: HA sent data but the chip never replied.
+  -- Reset counter on any healthy bidirectional session.
+  if tonumber(c2s) > 0 and tonumber(s2c) == 0 then
+    dead_sessions = dead_sessions + 1
+    logf("[bridge] dead session %d/%d (chip silent)", dead_sessions, MAX_DEAD_SESSIONS)
+    if dead_sessions >= MAX_DEAD_SESSIONS then
+      logf("[bridge] chip wedged — exiting with code 1 to trigger EFR32 rewake")
+      C.close(lfd)
+      C.close(sfd)
+      os.exit(1)
+    end
+  elseif tonumber(s2c) > 0 and tonumber(c2s) > 0 then
+    dead_sessions = 0
+  end
 end
 
 C.close(sfd)

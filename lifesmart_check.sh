@@ -40,12 +40,32 @@ for i in 1 2 3; do
   sleep 1
 done
 
-# === Phase 3: launch the bridge under a watchdog ===
-# The bridge configures termios and re-issues an ASH RST itself; the chip is
-# already in app mode by now, so this RST returns RSTACK normally.
+# === Phase 3: launch the bridge under a watchdog with chip-rewake on wedge ===
+# The bridge exits with code 1 when it detects the EFR32 stopped responding
+# (N consecutive sessions where HA sent data but the chip was silent). On that
+# signal, re-run the natureinitrd.lua wake sequence before restarting the bridge.
+# Log appends across restarts so the wedge/recovery history is preserved.
 ( while true; do
     /system/xbin/luajit /data/local/tmp/zb_bridge.lua "$SERIAL" "$PORT" \
-      >/data/local/tmp/zb_bridge.log 2>&1
+      >>/data/local/tmp/zb_bridge.log 2>&1
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      echo "$(date) [watchdog] chip wedge detected — re-running EFR32 wake sequence" \
+        >>/data/local/tmp/zb_bridge.log
+      (
+        cd /data/mgaopt/natureloader
+        export PATH=/data/mgaopt/bin:$PATH
+        /system/xbin/luajit \
+          -e"package.path='./?.lua;./lua/?.lua;';package.cpath='./?.so;./clib/?.so;'" \
+          natureinitrd.lua >/data/local/tmp/natureinitrd_rewake.log 2>&1
+      ) &
+      sleep "$WAKE_SECS"
+      pkill -9 zdogd_c 2>/dev/null
+      pkill -9 zdogd 2>/dev/null
+      pkill -9 luajit 2>/dev/null
+      echo "$(date) [watchdog] rewake done — restarting bridge" \
+        >>/data/local/tmp/zb_bridge.log
+    fi
     sleep 2
   done ) &
 
