@@ -54,6 +54,7 @@ local AF_INET     = 2
 local SOCK_STREAM = 1
 local SOL_SOCKET  = 1
 local SO_REUSEADDR= 2
+local SO_KEEPALIVE= 9
 local INADDR_ANY  = 0
 local SHUT_RDWR   = 2
 local O_RDWR      = 2
@@ -76,14 +77,33 @@ local POLLNVAL    = 0x0020
 local SERIAL = arg[1] or "/dev/ttyS5"
 local PORT   = tonumber(arg[2]) or 8880
 
-local function logf(fmt, ...)
-  io.stderr:write(os.date("%Y-%m-%d %H:%M:%S ") .. string.format(fmt, ...) .. "\n")
-  io.stderr:flush()
-end
-
--- Exit(1) after this many consecutive dead sessions (c2s>0, s2c=0) to signal
--- the watchdog to re-run the EFR32 wake sequence before restarting the bridge.
+-- Tunables
+-- Consecutive (c2s>0, s2c=0) sessions before we trigger an EFR32 rewake.
 local MAX_DEAD_SESSIONS = 3
+-- In-session: HA most recently sent data, but the chip has been silent past
+-- this long => declare wedge and exit(1) for rewake. Set well above bellows'
+-- ~12 s heartbeat timeout so we don't rewake on a single laggy heartbeat.
+local CHIP_TIMEOUT_S    = 60
+-- Whole session has had zero bytes either way for this long => close the
+-- client (HA can reconnect). Catches bellows holding a zombie TCP socket
+-- without sending heartbeats.
+local IDLE_TIMEOUT_S    = 300
+-- Poll wakeup so we can re-check the timeouts above without depending on
+-- traffic to drive the loop.
+local POLL_TIMEOUT_MS   = 2000
+
+-- Direct-syscall logger: bypass Lua's buffered io.stderr. A single fwrite
+-- error (e.g. transient ENOSPC) puts the FILE* in a sticky error state and
+-- silently swallows every subsequent line, which once cost us 18 hours of
+-- visibility into a wedged bridge. write(2) has no such trap.
+local logbuf_size = 1024
+local logbuf = ffi.new("char[?]", logbuf_size)
+local function logf(fmt, ...)
+  local line = os.date("%Y-%m-%d %H:%M:%S ") .. string.format(fmt, ...) .. "\n"
+  if #line > logbuf_size then line = line:sub(1, logbuf_size - 1) .. "\n" end
+  ffi.copy(logbuf, line)
+  C.write(2, logbuf, #line)
+end
 
 -- Open serial port — set termios ourselves (don't trust external stty)
 local sfd = C.open(SERIAL, O_RDWR + O_NOCTTY + O_NONBLOCK)
@@ -130,9 +150,10 @@ local dead_sessions = 0
 while true do
   local cfd = C.accept(lfd, nil, nil)
   if cfd < 0 then logf("[bridge] accept: %s", estr()); break end
-  -- non-blocking client
+  -- non-blocking client + TCP keepalive so dead peers eventually surface as POLLHUP
   local fl = C.fcntl(cfd, F_GETFL, 0)
   C.fcntl(cfd, F_SETFL, fl + O_NONBLOCK)
+  C.setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, one, 4)
   logf("[bridge] client connected fd=%d", cfd)
 
   local pfds = ffi.new("struct pollfd[2]")
@@ -140,61 +161,86 @@ while true do
   pfds[1].fd = cfd; pfds[1].events = POLLIN
 
   local s2c, c2s = 0ULL, 0ULL
-  local function dump_stats() logf("[bridge] traffic serial->tcp=%s tcp->serial=%s", tostring(s2c), tostring(c2s)) end
+  local t_start    = os.time()
+  local last_s2c_t = t_start
+  local last_c2s_t = t_start
+  local wedge_exit = false
 
   while true do
     pfds[0].revents = 0; pfds[1].revents = 0
-    local r = C.poll(pfds, 2, 30000)
+    local r = C.poll(pfds, 2, POLL_TIMEOUT_MS)
     if r < 0 then logf("[bridge] poll: %s", estr()); break end
-    if r == 0 then
-      -- idle; keep going
-    else
-      -- serial -> tcp
-      if pfds[0].revents ~= 0 then
-        if bit.band(pfds[0].revents, POLLIN) ~= 0 then
-          local n = C.read(sfd, buf, 8192)
-          if n > 0 then
-            local off = 0
-            while off < tonumber(n) do
-              local w = C.write(cfd, buf + off, n - off)
-              if w <= 0 then logf("[bridge] tcp write: %s", estr()); pfds[1].revents = POLLHUP; break end
-              off = off + tonumber(w)
-            end
-            s2c = s2c + n
-          end
-        end
-        if bit.band(pfds[0].revents, POLLERR + POLLHUP + POLLNVAL) ~= 0 then
-          logf("[bridge] serial fd error/hup")
-          break
-        end
-      end
-      -- tcp -> serial
-      if pfds[1].revents ~= 0 then
-        if bit.band(pfds[1].revents, POLLIN) ~= 0 then
-          local n = C.read(cfd, buf, 8192)
-          if n <= 0 then logf("[bridge] client closed (read=%d)", tonumber(n)); break end
+
+    -- serial -> tcp
+    if pfds[0].revents ~= 0 then
+      if bit.band(pfds[0].revents, POLLIN) ~= 0 then
+        local n = C.read(sfd, buf, 8192)
+        if n > 0 then
           local off = 0
           while off < tonumber(n) do
-            local w = C.write(sfd, buf + off, n - off)
-            if w <= 0 then logf("[bridge] serial write: %s", estr()); break end
+            local w = C.write(cfd, buf + off, n - off)
+            if w <= 0 then logf("[bridge] tcp write: %s", estr()); pfds[1].revents = POLLHUP; break end
             off = off + tonumber(w)
           end
-          c2s = c2s + n
-        end
-        if bit.band(pfds[1].revents, POLLERR + POLLHUP + POLLNVAL) ~= 0 then
-          logf("[bridge] client hup")
-          break
+          s2c = s2c + n
+          last_s2c_t = os.time()
         end
       end
+      if bit.band(pfds[0].revents, POLLERR + POLLHUP + POLLNVAL) ~= 0 then
+        logf("[bridge] serial fd error/hup")
+        break
+      end
+    end
+    -- tcp -> serial
+    if pfds[1].revents ~= 0 then
+      if bit.band(pfds[1].revents, POLLIN) ~= 0 then
+        local n = C.read(cfd, buf, 8192)
+        if n <= 0 then logf("[bridge] client closed (read=%d)", tonumber(n)); break end
+        local off = 0
+        while off < tonumber(n) do
+          local w = C.write(sfd, buf + off, n - off)
+          if w <= 0 then logf("[bridge] serial write: %s", estr()); break end
+          off = off + tonumber(w)
+        end
+        c2s = c2s + n
+        last_c2s_t = os.time()
+      end
+      if bit.band(pfds[1].revents, POLLERR + POLLHUP + POLLNVAL) ~= 0 then
+        logf("[bridge] client hup")
+        break
+      end
+    end
+
+    -- In-session liveness checks (driven by POLL_TIMEOUT_MS wakeups so they
+    -- still fire when neither fd is producing events).
+    local now = os.time()
+    -- Wedge: HA was the most recent sender, and the chip has been silent
+    -- past CHIP_TIMEOUT_S. exit(1) so the watchdog re-runs natureinitrd.lua.
+    if tonumber(c2s) > 0 and last_c2s_t > last_s2c_t and (now - last_s2c_t) > CHIP_TIMEOUT_S then
+      logf("[bridge] in-session wedge: chip silent %ds while HA active (c2s=%s s2c=%s)",
+           now - last_s2c_t, tostring(c2s), tostring(s2c))
+      wedge_exit = true
+      break
+    end
+    -- Idle: nothing either way for IDLE_TIMEOUT_S. Drop the client (no rewake)
+    -- — covers bellows holding a zombie socket after giving up heartbeats.
+    if (now - last_s2c_t) > IDLE_TIMEOUT_S and (now - last_c2s_t) > IDLE_TIMEOUT_S then
+      logf("[bridge] session idle %ds — dropping client", now - last_s2c_t)
+      break
     end
   end
 
-  dump_stats()
+  logf("[bridge] traffic serial->tcp=%s tcp->serial=%s", tostring(s2c), tostring(c2s))
   C.shutdown(cfd, SHUT_RDWR)
   C.close(cfd)
 
-  -- Detect chip wedge: HA sent data but the chip never replied.
-  -- Reset counter on any healthy bidirectional session.
+  if wedge_exit then
+    logf("[bridge] in-session wedge — exiting with code 1 to trigger EFR32 rewake")
+    C.close(lfd); C.close(sfd)
+    os.exit(1)
+  end
+
+  -- Post-session detector: HA sent bytes but the chip never replied.
   if tonumber(c2s) > 0 and tonumber(s2c) == 0 then
     dead_sessions = dead_sessions + 1
     logf("[bridge] dead session %d/%d (chip silent)", dead_sessions, MAX_DEAD_SESSIONS)
