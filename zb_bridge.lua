@@ -28,6 +28,8 @@ struct sockaddr_in {
 
 unsigned short htons(unsigned short v);
 
+struct linger { int l_onoff; int l_linger; };
+
 struct pollfd { int fd; short events; short revents; };
 int poll(struct pollfd *fds, unsigned long nfds, int timeout);
 
@@ -55,6 +57,7 @@ local SOCK_STREAM = 1
 local SOL_SOCKET  = 1
 local SO_REUSEADDR= 2
 local SO_KEEPALIVE= 9
+local SO_LINGER   = 13
 local INADDR_ANY  = 0
 local SHUT_RDWR   = 2
 local O_RDWR      = 2
@@ -154,6 +157,11 @@ while true do
   local fl = C.fcntl(cfd, F_GETFL, 0)
   C.fcntl(cfd, F_SETFL, fl + O_NONBLOCK)
   C.setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, one, 4)
+  -- l_onoff=1, l_linger=0 → kernel sends RST instead of FIN on any close,
+  -- including process death (OOM/SIGKILL). HA's bellows treats RST as a
+  -- recoverable error; clean FIN can wedge its disconnect coroutine.
+  local lng = ffi.new("struct linger", 1, 0)
+  C.setsockopt(cfd, SOL_SOCKET, SO_LINGER, lng, ffi.sizeof(lng))
   logf("[bridge] client connected fd=%d", cfd)
 
   local pfds = ffi.new("struct pollfd[2]")

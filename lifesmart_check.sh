@@ -45,7 +45,10 @@ done
 # (N consecutive sessions where HA sent data but the chip was silent). On that
 # signal, re-run the natureinitrd.lua wake sequence before restarting the bridge.
 # Log appends across restarts so the wedge/recovery history is preserved.
-( while true; do
+( echo -1000 >/proc/$$/oom_score_adj 2>/dev/null
+  while true; do
+    # Bridge is OOM-immune (luajit inherits oom_score_adj from this shell).
+    echo -1000 >/proc/$$/oom_score_adj 2>/dev/null
     /system/xbin/luajit /data/local/tmp/zb_bridge.lua "$SERIAL" "$PORT" \
       >>/data/local/tmp/zb_bridge.log 2>&1
     rc=$?
